@@ -1,7 +1,6 @@
 # 32-bit arm.
 
 libc_bionic_src_files_arm += \
-    arch-arm/generic/bionic/memcmp.S \
     arch-arm/generic/bionic/memcpy.S \
     arch-arm/generic/bionic/memset.S \
     arch-arm/generic/bionic/strcmp.S \
@@ -14,10 +13,31 @@ libc_bionic_src_files_exclude_arm += \
 
 libc_openbsd_src_files_exclude_arm += \
     upstream-openbsd/lib/libc/string/strcpy.c \
+    upstream-openbsd/lib/libc/string/memchr.c \
 
 #
 # Inherently architecture-specific code.
 #
+
+ifeq ($(ARCH_ARM_HAVE_ARMV7A),true)
+libc_bionic_src_files_arm += \
+    arch-arm/bionic/memchr_opt.S
+else
+libc_bionic_src_files_arm += \
+    bionic/memchr.c
+endif
+
+
+##########################################
+### CPU specific source files
+ifeq ($(ARCH_ARM_HAVE_NEON), true)
+libc_bionic_src_files_arm += \
+    arch-arm/bionic/memcmp_neon.S
+else
+libc_bionic_src_files_arm += \
+    arch-arm/bionic/memcmp.S
+endif
+
 
 libc_bionic_src_files_arm += \
     arch-arm/bionic/abort_arm.S \
