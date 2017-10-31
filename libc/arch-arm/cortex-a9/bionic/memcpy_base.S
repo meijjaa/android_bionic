@@ -38,102 +38,168 @@ ENTRY_PRIVATE(MEMCPY_BASE)
         .cfi_rel_offset lr, 4
 
         // Check so divider is at least 16 bytes, needed for alignment code.
+        cmp         r2, #0
+        ble         out
+        pld         [r1]
+        cmp         r2, #64
+        blt         .Lmemcpy_quick
+        eor         r3, r1, r0
+        tst         r3, #0x03               // temp data
+        bne         use_neon                // src and dest cannot make align
+        tst         r1, #0x03
+        beq         aligned_cpy
+
+make_align:
+        ldrb        r3, [r1], #1
+        subs        r2,  r2,  #1
+        strb        r3, [r0], #1
+        beq         out
+        tst         r1, #0x03
+        bne         make_align
+
+aligned_cpy:
+        cmp         r2, #68
+        blt         less_64_nocheck
+        tst         r1, #0x04
+        beq         aligned_64
+        ldr         r3, [r1], #4
+        subs        r2, #4
+        str         r3, [r0], #4               // align to 8 bytes
+        beq         out
+aligned_64:
+        subs        r2, #64
+        pld         [r1, #32]
+        blt         less_64
+        pld         [r1, #64]
+        pld         [r1, #96]
+        .align  3
+loop_main:
+        vldmia      r1!, {q0 - q3}              // 8
+        pld         [r1, #128]                  // 1
+        pld         [r1, #160]                  // 1
+        subs        r2,  #64                    // 1
+        vstmia      r0!, {q0 - q3}              // 8
+        bge         loop_main                   // 1  64 / 20 = 3.2 bytes/cycle
+
+less_64:
+        adds        r2,  #64
+        beq         out
+less_64_nocheck:
+        cmp         r2,  #8
+        blt         less_8
+loop_arm_8:
+        vldmia      r1!, {d0}
+        sub         r2,  #8
+        cmp         r2,  #8
+        vstmia      r0!, {d0}
+        bge         loop_arm_8
+less_8:
+        movs        r12, r2, lsl #30
+        itt         cs
+        ldrcs       r3, [r1], #4
+        strcs       r3, [r0], #4
+        itt         mi
+        ldrhmi      r3, [r1], #2
+        strhmi      r3, [r0], #2
+        tst         r2,  #1
+        itt         ne
+        ldrbne      r3, [r1], #1
+        strbne      r3, [r0], #1
+out:
+1:
+        pop         {r0, pc}
+
+use_neon:
+        cmp         r2, #64
+        blt         use_neon_less64
+use_neon_loop:
+        vld1.8      {q0, q1}, [r1]!
+        vld1.8      {q2, q3}, [r1]!
+        sub         r2, #64
+        pld         [r1, #64]
+        pld         [r1, #96]
+        cmp         r2, #64
+        vst1.8      {q0, q1}, [r0]!
+        vst1.8      {q2, q3}, [r0]!
+        bge         use_neon_loop
+use_neon_less64:
+        cmp         r2, #32
+        blt         use_neon_less32
+        vld1.8      {q0, q1}, [r1]!
+        subs        r2, #32
+        vst1.8      {q0, q1}, [r0]!
+        beq         out
+use_neon_less32:
         cmp         r2, #16
-        blo         5f
-
-        /* check if buffers are aligned. If so, run arm-only version */
-        eor         r3, r0, r1
-        ands        r3, r3, #0x3
-        beq         MEMCPY_BASE_ALIGNED
-
-        /* Check the upper size limit for Neon unaligned memory access in memcpy */
-        cmp         r2, #224
-        blo         3f
-
-        /* align destination to 16 bytes for the write-buffer */
-        rsb         r3, r0, #0
-        ands        r3, r3, #0xF
-        beq         3f
-
-        /* copy up to 15-bytes (count in r3) */
-        sub         r2, r2, r3
-        movs        ip, r3, lsl #31
-        itt         mi
-        ldrbmi      lr, [r1], #1
-        strbmi      lr, [r0], #1
-        itttt       cs
-        ldrbcs      ip, [r1], #1
-        ldrbcs      lr, [r1], #1
-        strbcs      ip, [r0], #1
-        strbcs      lr, [r0], #1
-        movs        ip, r3, lsl #29
-        bge         1f
-        // copies 4 bytes, destination 32-bits aligned
-        vld1.32     {d0[0]}, [r1]!
-        vst1.32     {d0[0]}, [r0, :32]!
-1:      bcc         2f
-        // copies 8 bytes, destination 64-bits aligned
+        blt         use_neon_less16
+        vld1.8      {q0}, [r1]!
+        subs        r2, #16
+        vst1.8      {q0}, [r0]!
+        beq         out
+use_neon_less16:
+        cmp         r2, #8
+        blt         less_8
         vld1.8      {d0}, [r1]!
-        vst1.8      {d0}, [r0, :64]!
-2:
-        /* preload immediately the next cache line, which we may need */
-        pld         [r1, #0]
-        pld         [r1, #(32 * 2)]
-3:
-        /* make sure we have at least 64 bytes to copy */
-        subs        r2, r2, #64
-        blo         2f
-
-        /* preload all the cache lines we need */
-        pld         [r1, #(32 * 4)]
-        pld         [r1, #(32 * 6)]
-
-1:      /* The main loop copies 64 bytes at a time */
-        vld1.8      {d0 - d3}, [r1]!
-        vld1.8      {d4 - d7}, [r1]!
-        pld         [r1, #(32 * 6)]
-        subs        r2, r2, #64
-        vst1.8      {d0 - d3}, [r0]!
-        vst1.8      {d4 - d7}, [r0]!
-        bhs         1b
-
-2:      /* fix-up the remaining count and make sure we have >= 32 bytes left */
-        add         r2, r2, #64
-        subs        r2, r2, #32
-        blo         4f
-
-3:      /* 32 bytes at a time. These cache lines were already preloaded */
-        vld1.8      {d0 - d3}, [r1]!
-        subs        r2, r2, #32
-        vst1.8      {d0 - d3}, [r0]!
-        bhs         3b
-
-4:      /* less than 32 left */
-        add         r2, r2, #32
-        tst         r2, #0x10
-        beq         5f
-        // copies 16 bytes, 128-bits aligned
-        vld1.8      {d0, d1}, [r1]!
-        vst1.8      {d0, d1}, [r0]!
-5:      /* copy up to 15-bytes (count in r2) */
-        movs        ip, r2, lsl #29
-        bcc         1f
-        vld1.8      {d0}, [r1]!
+        subs        r2, #8
         vst1.8      {d0}, [r0]!
-1:      bge         2f
-        vld1.32     {d0[0]}, [r1]!
-        vst1.32     {d0[0]}, [r0]!
-2:      movs        ip, r2, lsl #31
-        itt         mi
-        ldrbmi      r3, [r1], #1
-        strbmi      r3, [r0], #1
-        itttt       cs
-        ldrbcs      ip, [r1], #1
-        ldrbcs      lr, [r1], #1
-        strbcs      ip, [r0], #1
-        strbcs      lr, [r0], #1
+        beq         out
+        b           less_8
+.Lmemcpy_quick:
+        mov         lr, #1
+.Lmemcpy_quick_loop:
+        clz         r12, r2
+        rsb         r12, #31
+        lsl         r3,  lr, r12
+        tbb         [pc, r12]
+.Lmemcpy_quick_table:
+        //.byte       0
+        .byte       ((.Lmemcpy_quick_1  - .Lmemcpy_quick_table)/2)
+        .byte       ((.Lmemcpy_quick_2  - .Lmemcpy_quick_table)/2)
+        .byte       ((.Lmemcpy_quick_4  - .Lmemcpy_quick_table)/2)
+        .byte       ((.Lmemcpy_quick_8  - .Lmemcpy_quick_table)/2)
+        .byte       ((.Lmemcpy_quick_16 - .Lmemcpy_quick_table)/2)
+        .byte       ((.Lmemcpy_quick_32 - .Lmemcpy_quick_table)/2)
+        .p2align 2
+.Lmemcpy_quick_1:
+        ldrb        r12, [r1], #1
+        bic         r2, r3
+        strb        r12, [r0], #1
+        cbz         r2, .Lout_quick
+        b           .Lmemcpy_quick_loop
+.Lmemcpy_quick_2:
+        ldrh        r12, [r1], #2
+        bic         r2, r3
+        strh        r12, [r0], #2
+        cbz         r2, .Lout_quick
+        b           .Lmemcpy_quick_loop
+.Lmemcpy_quick_4:
+        ldr         r12, [r1], #4
+        bic         r2, r3
+        str         r12, [r0], #4
+        cbz         r2, .Lout_quick
+        b           .Lmemcpy_quick_loop
+.Lmemcpy_quick_8:
+        vld1.8      {d0}, [r1]!
+        bic         r2, r3
+        vst1.8      {d0}, [r0]!
+        cbz         r2, .Lout_quick
+        b           .Lmemcpy_quick_loop
+.Lmemcpy_quick_16:
+        vld1.8      {d0, d1}, [r1]!
+        bic         r2, r3
+        vst1.8      {d0, d1}, [r0]!
+        cbz         r2, .Lout_quick
+        b           .Lmemcpy_quick_loop
+.Lmemcpy_quick_32:
+        vld1.8      {d0, d1, d2, d3}, [r1]!
+        bic         r2, r3
+        vst1.8      {d0, d1, d2, d3}, [r0]!
+        cbz         r2, .Lout_quick
+        b           .Lmemcpy_quick_loop
+.Lout_quick:
+        pop         {r0, pc}
 
-        ldmfd       sp!, {r0, pc}
+
 END(MEMCPY_BASE)
 
 ENTRY_PRIVATE(MEMCPY_BASE_ALIGNED)
